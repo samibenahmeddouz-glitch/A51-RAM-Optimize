@@ -6,7 +6,11 @@ import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.graphics.Color;
+import android.graphics.Canvas;
+import android.graphics.Paint;
+import android.graphics.Path;
 import android.view.Gravity;
+import android.view.View;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
@@ -30,6 +34,8 @@ public class MainActivity extends Activity {
     private TextView dashboard;
     private TextView statusView;
     private TextView historyView;
+
+    private HistoryChartView chartView;
 
     private SharedPreferences preferences;
 
@@ -83,6 +89,21 @@ public class MainActivity extends Activity {
         dashboard.setPadding(0, 24, 0, 24);
         panel.addView(dashboard);
 
+        TextView chartTitle = new TextView(this);
+        chartTitle.setText("RAM / ZRAM CHART - 24 HOURS");
+        chartTitle.setTextColor(0xFF40C4FF);
+        chartTitle.setTextSize(19);
+        chartTitle.setPadding(0, 20, 0, 12);
+        panel.addView(chartTitle);
+
+        chartView = new HistoryChartView();
+        LinearLayout.LayoutParams chartParams =
+                new LinearLayout.LayoutParams(
+                        LinearLayout.LayoutParams.MATCH_PARENT,
+                        dp(290)
+                );
+        panel.addView(chartView, chartParams);
+
         TextView historyTitle = new TextView(this);
         historyTitle.setText("RAM / ZRAM HISTORY");
         historyTitle.setTextColor(0xFF40C4FF);
@@ -100,6 +121,10 @@ public class MainActivity extends Activity {
         setContentView(scroll);
 
         refresh.run();
+    }
+
+    private int dp(float value) {
+        return (int) (value * getResources().getDisplayMetrics().density + 0.5f);
     }
 
     private void updateDashboard() {
@@ -152,6 +177,10 @@ public class MainActivity extends Activity {
         dashboard.setText(readReport(usage, minUsage, maxUsage));
 
         saveHistorySample(usage);
+
+        JSONArray samples = getHistorySamples();
+
+        chartView.setSamples(samples);
         historyView.setText(readHistory());
     }
 
@@ -172,10 +201,7 @@ public class MainActivity extends Activity {
         lastSampleTime = now;
 
         try {
-            JSONArray history = new JSONArray(
-                    preferences.getString("samples", "[]")
-            );
-
+            JSONArray history = getHistorySamples();
             JSONArray updated = new JSONArray();
 
             for (int i = 0; i < history.length(); i++) {
@@ -210,6 +236,16 @@ public class MainActivity extends Activity {
         }
     }
 
+    private JSONArray getHistorySamples() {
+        try {
+            return new JSONArray(
+                    preferences.getString("samples", "[]")
+            );
+        } catch (Exception e) {
+            return new JSONArray();
+        }
+    }
+
     private long readZramUsed() {
 
         String value = readTextFile("/sys/block/zram0/mm_stat");
@@ -235,9 +271,7 @@ public class MainActivity extends Activity {
         StringBuilder out = new StringBuilder();
 
         try {
-            JSONArray history = new JSONArray(
-                    preferences.getString("samples", "[]")
-            );
+            JSONArray history = getHistorySamples();
 
             if (history.length() == 0) {
                 return "Waiting for first history reading...";
@@ -425,6 +459,237 @@ public class MainActivity extends Activity {
                     .append(": unavailable (")
                     .append(e.getClass().getSimpleName())
                     .append(")\n");
+        }
+    }
+
+    // Custom chart: RAM and ZRAM use separate scales.
+
+    private class HistoryChartView extends View {
+
+        private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
+
+        private final ArrayList<Sample> samples = new ArrayList<>();
+
+        private final int backgroundColor = 0xFF17232D;
+        private final int gridColor = 0xFF40515E;
+        private final int textColor = 0xFFEAF2F8;
+        private final int ramColor = 0xFF40C4FF;
+        private final int zramColor = 0xFFFFC107;
+
+        HistoryChartView() {
+            super(MainActivity.this);
+            setBackgroundColor(backgroundColor);
+        }
+
+        void setSamples(JSONArray history) {
+
+            samples.clear();
+
+            long now = System.currentTimeMillis();
+
+            for (int i = 0; i < history.length(); i++) {
+                try {
+                    JSONObject item = history.getJSONObject(i);
+
+                    long time = item.getLong("time");
+
+                    if (now - time <= 86400000L) {
+                        samples.add(new Sample(
+                                time,
+                                (float) item.getDouble("ram"),
+                                (float) item.getDouble("zram")
+                        ));
+                    }
+
+                } catch (Exception ignored) {
+                }
+            }
+
+            invalidate();
+        }
+
+        @Override
+        protected void onDraw(Canvas canvas) {
+            super.onDraw(canvas);
+
+            float density = getResources().getDisplayMetrics().density;
+
+            float left = 54 * density;
+            float right = getWidth() - 14 * density;
+            float width = right - left;
+
+            float top = 24 * density;
+            float graphHeight = 82 * density;
+            float gap = 55 * density;
+
+            if (samples.isEmpty()) {
+                drawText(canvas, "Waiting for history data",
+                        left, top + 40 * density, textColor, 13 * density);
+                return;
+            }
+
+            drawGraph(
+                    canvas, "RAM USAGE (%)",
+                    left, top, width, graphHeight,
+                    100f, ramColor, true
+            );
+
+            float maxZram = 100f;
+
+            for (Sample sample : samples) {
+                maxZram = Math.max(maxZram, sample.zram);
+            }
+
+            maxZram = (float) (Math.ceil(maxZram / 100.0) * 100.0);
+
+            drawGraph(
+                    canvas, "ZRAM USED (MB)",
+                    left, top + graphHeight + gap,
+                    width, graphHeight,
+                    maxZram, zramColor, false
+            );
+
+            float bottom = top + 2 * graphHeight + gap;
+
+            String first = timeLabel(samples.get(0).time);
+            String last = timeLabel(samples.get(samples.size() - 1).time);
+
+            drawText(canvas, first,
+                    left, bottom + 24 * density,
+                    textColor, 10 * density);
+
+            drawText(canvas, last,
+                    right - 38 * density, bottom + 24 * density,
+                    textColor, 10 * density);
+
+            drawText(canvas, "BLUE = RAM     YELLOW = ZRAM",
+                    left, bottom + 43 * density,
+                    textColor, 10 * density);
+        }
+
+        private void drawGraph(
+                Canvas canvas,
+                String title,
+                float left,
+                float top,
+                float width,
+                float height,
+                float maxValue,
+                int lineColor,
+                boolean isRam
+        ) {
+
+            float density = getResources().getDisplayMetrics().density;
+
+            drawText(canvas, title, left, top - 8 * density,
+                    lineColor, 12 * density);
+
+            float graphTop = top + 8 * density;
+            float graphBottom = graphTop + height;
+
+            paint.setColor(gridColor);
+            paint.setStrokeWidth(1f * density);
+            paint.setStyle(Paint.Style.STROKE);
+
+            for (int i = 0; i <= 4; i++) {
+                float y = graphTop + height * i / 4f;
+                canvas.drawLine(left, y, left + width, y, paint);
+            }
+
+            paint.setStyle(Paint.Style.FILL);
+
+            for (int i = 0; i <= 4; i++) {
+                float value = maxValue * (4 - i) / 4f;
+                float y = graphTop + height * i / 4f;
+
+                String label = String.format(
+                        Locale.US, "%.0f", value
+                );
+
+                drawText(canvas, label,
+                        5 * density, y + 4 * density,
+                        textColor, 10 * density);
+            }
+
+            if (samples.size() == 1) {
+                float value = isRam
+                        ? samples.get(0).ram
+                        : samples.get(0).zram;
+
+                float y = graphBottom -
+                        (value / maxValue) * height;
+
+                paint.setColor(lineColor);
+                canvas.drawCircle(left + width / 2f, y,
+                        4 * density, paint);
+                return;
+            }
+
+            Path path = new Path();
+
+            for (int i = 0; i < samples.size(); i++) {
+
+                Sample sample = samples.get(i);
+
+                float x = left +
+                        width * i / (samples.size() - 1f);
+
+                float value = isRam ? sample.ram : sample.zram;
+
+                float y = graphBottom -
+                        (value / maxValue) * height;
+
+                y = Math.max(graphTop, Math.min(graphBottom, y));
+
+                if (i == 0) {
+                    path.moveTo(x, y);
+                } else {
+                    path.lineTo(x, y);
+                }
+            }
+
+            paint.setColor(lineColor);
+            paint.setStrokeWidth(2.5f * density);
+            paint.setStyle(Paint.Style.STROKE);
+            paint.setStrokeCap(Paint.Cap.ROUND);
+            paint.setStrokeJoin(Paint.Join.ROUND);
+
+            canvas.drawPath(path, paint);
+
+            paint.setStyle(Paint.Style.FILL);
+        }
+
+        private void drawText(
+                Canvas canvas,
+                String value,
+                float x,
+                float y,
+                int color,
+                float size
+        ) {
+            paint.setColor(color);
+            paint.setTextSize(size);
+            paint.setTypeface(android.graphics.Typeface.DEFAULT);
+            paint.setStyle(Paint.Style.FILL);
+            canvas.drawText(value, x, y, paint);
+        }
+
+        private String timeLabel(long time) {
+            return new SimpleDateFormat(
+                    "HH:mm", Locale.getDefault()
+            ).format(new Date(time));
+        }
+    }
+
+    private static class Sample {
+        long time;
+        float ram;
+        float zram;
+
+        Sample(long time, float ram, float zram) {
+            this.time = time;
+            this.ram = ram;
+            this.zram = zram;
         }
     }
 

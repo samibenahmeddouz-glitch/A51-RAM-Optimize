@@ -10,10 +10,17 @@ import android.view.Gravity;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
+import android.content.SharedPreferences;
+
+import org.json.JSONArray;
+import org.json.JSONObject;
 
 import java.io.BufferedReader;
 import java.io.FileReader;
 import java.io.IOException;
+import java.text.SimpleDateFormat;
+import java.util.ArrayList;
+import java.util.Date;
 import java.util.Locale;
 
 public class MainActivity extends Activity {
@@ -22,10 +29,15 @@ public class MainActivity extends Activity {
 
     private TextView dashboard;
     private TextView statusView;
+    private TextView historyView;
+
+    private SharedPreferences preferences;
 
     private double minUsage = 100.0;
     private double maxUsage = 0.0;
     private boolean hasValidReading = false;
+
+    private long lastSampleTime = 0;
 
     private final Runnable refresh = new Runnable() {
         @Override
@@ -39,6 +51,8 @@ public class MainActivity extends Activity {
     public void onCreate(Bundle state) {
         super.onCreate(state);
 
+        preferences = getSharedPreferences("ram_history", MODE_PRIVATE);
+
         getWindow().getDecorView().setBackgroundColor(0xFF101820);
 
         ScrollView scroll = new ScrollView(this);
@@ -49,7 +63,7 @@ public class MainActivity extends Activity {
 
         TextView title = new TextView(this);
         title.setText("A51 RAM OPTIMIZER");
-        title.setTextColor(0xFFFFFFFF);
+        title.setTextColor(Color.WHITE);
         title.setTextSize(23);
         title.setGravity(Gravity.CENTER);
         title.setPadding(0, 10, 0, 24);
@@ -66,9 +80,22 @@ public class MainActivity extends Activity {
         dashboard.setTextColor(0xFFEAF2F8);
         dashboard.setTextSize(15);
         dashboard.setLineSpacing(8f, 1f);
-        dashboard.setPadding(0, 24, 0, 0);
-
+        dashboard.setPadding(0, 24, 0, 24);
         panel.addView(dashboard);
+
+        TextView historyTitle = new TextView(this);
+        historyTitle.setText("RAM / ZRAM HISTORY");
+        historyTitle.setTextColor(0xFF40C4FF);
+        historyTitle.setTextSize(19);
+        historyTitle.setPadding(0, 20, 0, 12);
+        panel.addView(historyTitle);
+
+        historyView = new TextView(this);
+        historyView.setTextColor(0xFFEAF2F8);
+        historyView.setTextSize(14);
+        historyView.setLineSpacing(8f, 1f);
+        panel.addView(historyView);
+
         scroll.addView(panel);
         setContentView(scroll);
 
@@ -123,6 +150,134 @@ public class MainActivity extends Activity {
         statusView.setTextColor(color);
 
         dashboard.setText(readReport(usage, minUsage, maxUsage));
+
+        saveHistorySample(usage);
+        historyView.setText(readHistory());
+    }
+
+    private void saveHistorySample(double ramUsage) {
+
+        long now = System.currentTimeMillis();
+
+        if (lastSampleTime != 0 && now - lastSampleTime < 60000) {
+            return;
+        }
+
+        long zramUsed = readZramUsed();
+
+        if (zramUsed < 0) {
+            return;
+        }
+
+        lastSampleTime = now;
+
+        try {
+            JSONArray history = new JSONArray(
+                    preferences.getString("samples", "[]")
+            );
+
+            JSONArray updated = new JSONArray();
+
+            for (int i = 0; i < history.length(); i++) {
+                JSONObject item = history.getJSONObject(i);
+
+                if (now - item.getLong("time") <= 86400000L) {
+                    updated.put(item);
+                }
+            }
+
+            JSONObject sample = new JSONObject();
+            sample.put("time", now);
+            sample.put("ram", ramUsage);
+            sample.put("zram", zramUsed / 1048576.0);
+
+            updated.put(sample);
+
+            JSONArray limited = new JSONArray();
+
+            int start = Math.max(0, updated.length() - 1440);
+
+            for (int i = start; i < updated.length(); i++) {
+                limited.put(updated.getJSONObject(i));
+            }
+
+            preferences.edit()
+                    .putString("samples", limited.toString())
+                    .apply();
+
+        } catch (Exception e) {
+            // History errors do not interrupt monitoring.
+        }
+    }
+
+    private long readZramUsed() {
+
+        String value = readTextFile("/sys/block/zram0/mm_stat");
+
+        if (value == null) return -1;
+
+        try {
+            String[] parts = value.trim().split("\\s+");
+
+            if (parts.length >= 3) {
+                return Long.parseLong(parts[2]);
+            }
+
+        } catch (Exception e) {
+            return -1;
+        }
+
+        return -1;
+    }
+
+    private String readHistory() {
+
+        StringBuilder out = new StringBuilder();
+
+        try {
+            JSONArray history = new JSONArray(
+                    preferences.getString("samples", "[]")
+            );
+
+            if (history.length() == 0) {
+                return "Waiting for first history reading...";
+            }
+
+            SimpleDateFormat format =
+                    new SimpleDateFormat("HH:mm:ss", Locale.getDefault());
+
+            out.append("Saved readings: ")
+                    .append(history.length())
+                    .append("\n\n");
+
+            int start = Math.max(0, history.length() - 10);
+
+            for (int i = history.length() - 1; i >= start; i--) {
+
+                JSONObject item = history.getJSONObject(i);
+
+                String time = format.format(
+                        new Date(item.getLong("time"))
+                );
+
+                double ram = item.getDouble("ram");
+                double zram = item.getDouble("zram");
+
+                out.append(time)
+                        .append(" | RAM: ")
+                        .append(String.format(Locale.US, "%.1f%%", ram))
+                        .append(" | ZRAM: ")
+                        .append(String.format(Locale.US, "%.1f MB", zram))
+                        .append('\n');
+            }
+
+            out.append("\nHistory is kept for 24 hours.");
+
+        } catch (Exception e) {
+            out.append("History unavailable.");
+        }
+
+        return out.toString();
     }
 
     private String readReport() {
@@ -203,6 +358,24 @@ public class MainActivity extends Activity {
         return -1;
     }
 
+    private String readTextFile(String file) {
+
+        try (BufferedReader br = new BufferedReader(new FileReader(file))) {
+
+            StringBuilder value = new StringBuilder();
+            String line;
+
+            while ((line = br.readLine()) != null) {
+                value.append(line).append(' ');
+            }
+
+            return value.toString().trim();
+
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
     private void appendFile(StringBuilder out, String file, String[] keys) {
 
         try (BufferedReader br = new BufferedReader(new FileReader(file))) {
@@ -221,10 +394,7 @@ public class MainActivity extends Activity {
             }
 
         } catch (IOException e) {
-
-            out.append("Unavailable: ")
-                    .append(file)
-                    .append('\n');
+            out.append("Unavailable: ").append(file).append('\n');
         }
     }
 

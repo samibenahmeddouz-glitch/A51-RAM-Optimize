@@ -21,8 +21,6 @@ public final class LoadProbe implements IXposedHookLoadPackage {
     private static final AtomicBoolean STARTED =
             new AtomicBoolean(false);
 
-    private static ScheduledExecutorService executor;
-
     @Override
     public void handleLoadPackage(
             XC_LoadPackage.LoadPackageParam lpparam) {
@@ -35,13 +33,14 @@ public final class LoadProbe implements IXposedHookLoadPackage {
             return;
         }
 
-        XposedBridge.log("A51RAM: RAM/ZRAM monitor started.");
+        XposedBridge.log("A51RAM: Advanced monitor started.");
 
-        executor = Executors.newSingleThreadScheduledExecutor(r -> {
-            Thread thread = new Thread(r, "A51RAM-Monitor");
-            thread.setDaemon(true);
-            return thread;
-        });
+        ScheduledExecutorService executor =
+                Executors.newSingleThreadScheduledExecutor(r -> {
+                    Thread thread = new Thread(r, "A51RAM-Monitor");
+                    thread.setDaemon(true);
+                    return thread;
+                });
 
         executor.scheduleAtFixedRate(
                 LoadProbe::collectStats,
@@ -54,20 +53,34 @@ public final class LoadProbe implements IXposedHookLoadPackage {
     private static void collectStats() {
 
         try {
-            String memTotal = readMemInfo("MemTotal");
-            String memAvailable = readMemInfo("MemAvailable");
-            String memFree = readMemInfo("MemFree");
-
-            String diskSize = readFile(
-                    "/sys/block/zram0/disksize");
+            long total = readMemInfo("MemTotal");
+            long available = readMemInfo("MemAvailable");
+            long free = readMemInfo("MemFree");
 
             String mmStat = readFile(
                     "/sys/block/zram0/mm_stat");
 
+            String diskSize = readFile(
+                    "/sys/block/zram0/disksize");
+
             String algorithm = readFile(
                     "/sys/block/zram0/comp_algorithm");
 
-            String zramInfo = "unavailable";
+            String ramUsage = "unavailable";
+
+            if (total > 0 && available >= 0) {
+                double percentage =
+                        ((double) (total - available) / total) * 100.0;
+
+                ramUsage = String.format(
+                        Locale.US, "%.1f%%", percentage);
+            }
+
+            String zramOriginal = "unavailable";
+            String zramCompressed = "unavailable";
+            String zramUsed = "unavailable";
+            String compressionRatio = "unavailable";
+            String savings = "unavailable";
 
             if (mmStat != null) {
                 String[] values = mmStat.trim().split("\\s+");
@@ -77,13 +90,20 @@ public final class LoadProbe implements IXposedHookLoadPackage {
                     long compressed = Long.parseLong(values[1]);
                     long used = Long.parseLong(values[2]);
 
-                    zramInfo = String.format(
-                            Locale.US,
-                            "original=%dMB compressed=%dMB used=%dMB",
-                            original / 1048576,
-                            compressed / 1048576,
-                            used / 1048576
-                    );
+                    zramOriginal = mb(original);
+                    zramCompressed = mb(compressed);
+                    zramUsed = mb(used);
+
+                    if (compressed > 0) {
+                        double ratio =
+                                (double) original / compressed;
+
+                        compressionRatio = String.format(
+                                Locale.US, "%.2fx", ratio);
+                    }
+
+                    long saved = original - used;
+                    savings = mb(saved);
                 }
             }
 
@@ -91,19 +111,30 @@ public final class LoadProbe implements IXposedHookLoadPackage {
 
             if (diskSize != null) {
                 long bytes = Long.parseLong(diskSize.trim());
-
-                sizeInfo = (bytes / 1048576) + "MB";
+                sizeInfo = mb(bytes);
             }
 
             XposedBridge.log(
-                    "A51RAM STATS: " +
-                    "Total=" + memTotal +
-                    " Available=" + memAvailable +
-                    " Free=" + memFree +
-                    " ZRAM_Size=" + sizeInfo +
-                    " ZRAM={" + zramInfo + "}" +
-                    " Algorithm=" + algorithm
+                    "A51RAM ADVANCED: " +
+                    "Total=" + total + "kB " +
+                    "Available=" + available + "kB " +
+                    "Free=" + free + "kB " +
+                    "RAM_Usage=" + ramUsage + " " +
+                    "ZRAM_Size=" + sizeInfo + " " +
+                    "Original=" + zramOriginal + " " +
+                    "Compressed=" + zramCompressed + " " +
+                    "Used=" + zramUsed + " " +
+                    "Compression_Ratio=" + compressionRatio + " " +
+                    "Savings=" + savings + " " +
+                    "Algorithm=" + algorithm
             );
+
+            if (total > 16L * 1024L * 1024L) {
+                XposedBridge.log(
+                        "A51RAM WARNING: Reported RAM total is unusually high; " +
+                        "RAM usage percentage needs verification."
+                );
+            }
 
         } catch (Exception e) {
             XposedBridge.log(
@@ -111,7 +142,8 @@ public final class LoadProbe implements IXposedHookLoadPackage {
         }
     }
 
-    private static String readMemInfo(String key) {
+    private static long readMemInfo(String key)
+            throws IOException {
 
         try (BufferedReader reader =
                      new BufferedReader(
@@ -120,18 +152,17 @@ public final class LoadProbe implements IXposedHookLoadPackage {
             String line;
 
             while ((line = reader.readLine()) != null) {
-
                 if (line.startsWith(key + ":")) {
-                    return line.substring(
+                    String value = line.substring(
                             line.indexOf(':') + 1).trim();
+
+                    String[] parts = value.split("\\s+");
+                    return Long.parseLong(parts[0]);
                 }
             }
-
-        } catch (IOException e) {
-            return "unavailable";
         }
 
-        return "unavailable";
+        return -1;
     }
 
     private static String readFile(String path) {
@@ -145,5 +176,13 @@ public final class LoadProbe implements IXposedHookLoadPackage {
         } catch (IOException e) {
             return null;
         }
+    }
+
+    private static String mb(long bytes) {
+        return String.format(
+                Locale.US,
+                "%.2fMB",
+                bytes / 1048576.0
+        );
     }
 }

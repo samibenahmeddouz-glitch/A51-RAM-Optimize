@@ -2,6 +2,7 @@
 package com.a51.ramoptimizer;
 
 import android.app.Activity;
+import android.app.AlertDialog;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
@@ -42,6 +43,10 @@ public class MainActivity extends Activity {
     private double minUsage = 100.0;
     private double maxUsage = 0.0;
     private boolean hasValidReading = false;
+
+    // Smart RAM alert
+    private int highRamReadings = 0;
+    private boolean highRamAlertShown = false;
 
     private long lastSampleTime = 0;
 
@@ -151,6 +156,36 @@ public class MainActivity extends Activity {
         } else {
             minUsage = Math.min(minUsage, usage);
             maxUsage = Math.max(maxUsage, usage);
+        }
+
+        // Smart alert: 3 consecutive readings at or above 85%.
+        if (usage >= 85.0) {
+
+            highRamReadings++;
+
+            if (highRamReadings >= 3 && !highRamAlertShown) {
+
+                highRamAlertShown = true;
+
+                new AlertDialog.Builder(this)
+                        .setTitle("High RAM Usage Warning")
+                        .setMessage(
+                                "RAM usage has remained at or above 85% " +
+                                "for 3 consecutive readings.\n\n" +
+                                String.format(
+                                        Locale.US,
+                                        "Current RAM usage: %.1f%%",
+                                        usage
+                                )
+                        )
+                        .setPositiveButton("OK", null)
+                        .show();
+            }
+
+        } else {
+
+            highRamReadings = 0;
+            highRamAlertShown = false;
         }
 
         String level;
